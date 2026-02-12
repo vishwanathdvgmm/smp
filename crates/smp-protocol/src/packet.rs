@@ -1,0 +1,75 @@
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
+
+use crate::error::ProtocolError;
+
+pub const SMP_VERSION: u8 = 1;
+
+pub fn identity_hash(pubkey_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(pubkey_bytes);
+    hasher.finalize().into()
+}
+
+#[derive(Clone)]
+pub struct SmpPacket {
+    pub version: u8,
+    pub flags: u8,
+
+    pub sender_identity_hash: [u8; 32],
+    pub recipient_identity_hash: [u8; 32],
+
+    pub ephemeral_pubkey: [u8; 32],
+    pub timestamp: u64,
+
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+
+    pub signature: [u8; 64],
+}
+
+impl SmpPacket {
+    pub fn serialize_without_signature(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        out.push(self.version);
+        out.push(self.flags);
+
+        out.extend_from_slice(&self.sender_identity_hash);
+        out.extend_from_slice(&self.recipient_identity_hash);
+        out.extend_from_slice(&self.ephemeral_pubkey);
+
+        out.extend_from_slice(&self.timestamp.to_be_bytes());
+
+        out.extend_from_slice(&self.nonce);
+
+        let ct_len = (self.ciphertext.len() as u32).to_be_bytes();
+        out.extend_from_slice(&ct_len);
+        out.extend_from_slice(&self.ciphertext);
+
+        out
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = self.serialize_without_signature();
+        out.extend_from_slice(&self.signature);
+        out
+    }
+}
+
+impl SmpPacket {
+    pub fn sign(&mut self, signing_key: &ed25519_dalek::SigningKey) {
+        let message = self.serialize_without_signature();
+        let sig: Signature = signing_key.sign(&message);
+        self.signature = sig.to_bytes();
+    }
+
+    pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<(), ProtocolError> {
+        let message = self.serialize_without_signature();
+        let sig = Signature::from_bytes(&self.signature);
+
+        verifying_key
+            .verify(&message, &sig)
+            .map_err(|_| ProtocolError::SignatureInvalid)
+    }
+}
