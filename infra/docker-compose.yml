@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: smp-postgres
+    environment:
+      POSTGRES_USER: SMP
+      POSTGRES_PASSWORD: smp@123
+      POSTGRES_DB: smp
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  
+  minio:
+    image: minio/minio
+    container_name: smp-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: smp
+      MINIO_ROOT_PASSWORD: smp12345
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+volumes:
+  minio_data:
+  postgres_data:

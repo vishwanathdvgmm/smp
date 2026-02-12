@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/smp-crypto-core",
+    "crates/smp-protocol",
+    "crates/smp-registry",
+    "crates/smp-relay",
+    "crates/smp-discovery",
+    "crates/smp-trust",
+    "crates/smp-cli"
+]
+
+resolver = "2"
