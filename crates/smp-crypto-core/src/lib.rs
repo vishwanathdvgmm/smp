@@ -5,20 +5,18 @@ pub mod identity;
 
 #[cfg(test)]
 mod tests {
+    use crate::encryption::{decrypt, encrypt};
+    use crate::handshake::derive_session_key;
     use crate::identity::Identity;
-    use crate::handshake::derive_shared_secret;
-    use crate::encryption::{encrypt, decrypt};
 
     #[test]
     fn test_secure_message_flow() {
         let alice = Identity::generate();
         let bob = Identity::generate();
 
-        let alice_key =
-            derive_shared_secret(&alice.encryption_secret, &bob.encryption_public);
+        let alice_key = derive_session_key(&alice.encryption_secret, &bob.encryption_public);
 
-        let bob_key =
-            derive_shared_secret(&bob.encryption_secret, &alice.encryption_public);
+        let bob_key = derive_session_key(&bob.encryption_secret, &alice.encryption_public);
 
         assert_eq!(alice_key, bob_key);
 

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 smp-crypto-core = { path = "../smp-crypto-core" }
 ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 sha2 = "0.10"
 bytes = "1"
 thiserror = "1.0"

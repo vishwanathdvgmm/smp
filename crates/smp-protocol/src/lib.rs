@@ -38,14 +38,14 @@ mod tests {
 
 #[cfg(test)]
 mod integration_tests {
+    use super::packet::*;
     use smp_crypto_core::{
         encryption::{decrypt, encrypt},
-        handshake::derive_shared_secret,
+        handshake::{derive_session_key, generate_ephemeral},
         identity::Identity,
     };
-
-    use super::packet::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use x25519_dalek::PublicKey;
 
     #[test]
     fn test_full_async_message_flow() {
@@ -53,15 +53,11 @@ mod integration_tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
 
-        // Alice derives shared session key
-        let alice_session_key =
-            derive_shared_secret(&alice.encryption_secret, &bob.encryption_public);
+        // Alice generates ephemeral key
+        let eph = generate_ephemeral();
 
-        // Bob derives same session key
-        let bob_session_key =
-            derive_shared_secret(&bob.encryption_secret, &alice.encryption_public);
-
-        assert_eq!(alice_session_key, bob_session_key);
+        // Alice derives session key
+        let alice_session_key = derive_session_key(&eph.secret, &bob.encryption_public);
 
         // Alice encrypts message
         let plaintext = b"Hello Bob, this is SMP.";
@@ -76,7 +72,7 @@ mod integration_tests {
             sender_identity_hash: identity_hash(alice.verifying_key.as_bytes()),
             recipient_identity_hash: identity_hash(bob.verifying_key.as_bytes()),
 
-            ephemeral_pubkey: alice.encryption_public.to_bytes(),
+            ephemeral_pubkey: eph.public.to_bytes(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -95,6 +91,12 @@ mod integration_tests {
         packet
             .verify(&alice.verifying_key)
             .expect("Signature verification failed");
+
+        // Bob reconstructs ephemeral public key
+        let alice_ephemeral_pub = PublicKey::from(packet.ephemeral_pubkey);
+
+        // Bob derives session key
+        let bob_session_key = derive_session_key(&bob.encryption_secret, &alice_ephemeral_pub);
 
         // Bob decrypts
         let decrypted = decrypt(&bob_session_key, &packet.ciphertext, &packet.nonce)
