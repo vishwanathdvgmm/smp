@@ -22,9 +22,9 @@ mod tests {
 
         let message = b"Hello SMP";
 
-        let (ciphertext, nonce) = encrypt(&alice_key, message).unwrap();
+        let (ciphertext, nonce) = encrypt(&alice_key, message, &[]).unwrap();
 
-        let decrypted = decrypt(&bob_key, &ciphertext, &nonce).unwrap();
+        let decrypted = decrypt(&bob_key, &ciphertext, &nonce, &[]).unwrap();
 
         assert_eq!(message.to_vec(), decrypted);
     }

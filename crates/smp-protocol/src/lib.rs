@@ -15,6 +15,8 @@ mod tests {
             version: SMP_VERSION,
             flags: 0,
 
+            message_id: [0u8; 32],
+
             sender_identity_hash: identity_hash(alice.verifying_key.as_bytes()),
             recipient_identity_hash: [0u8; 32],
 
@@ -61,13 +63,13 @@ mod integration_tests {
 
         // Alice encrypts message
         let plaintext = b"Hello Bob, this is SMP.";
-        let (ciphertext, nonce) =
-            encrypt(&alice_session_key, plaintext).expect("Encryption failed");
 
-        // Construct packet
+        // Construct packet FIRST (without ciphertext & signature)
         let mut packet = SmpPacket {
             version: SMP_VERSION,
             flags: 0,
+
+            message_id: [0u8; 32],
 
             sender_identity_hash: identity_hash(alice.verifying_key.as_bytes()),
             recipient_identity_hash: identity_hash(bob.verifying_key.as_bytes()),
@@ -78,19 +80,33 @@ mod integration_tests {
                 .unwrap()
                 .as_secs(),
 
-            nonce,
-            ciphertext,
-
+            nonce: [0u8; 12],   // temporary placeholder
+            ciphertext: vec![], // temporary placeholder
             signature: [0u8; 64],
         };
+
+        // Associated Data = header (without signature)
+        let associated_data = packet.serialize_aad();
+
+        // Encrypt using AAD
+        let (ciphertext, nonce) =
+            encrypt(&alice_session_key, plaintext, &associated_data).expect("Encryption failed");
+
+        let message_id =
+            compute_message_id(&packet.ephemeral_pubkey, packet.timestamp, &ciphertext);
+
+        packet.message_id = message_id;
+
+        packet.nonce = nonce;
+        packet.ciphertext = ciphertext;
 
         // Alice signs packet
         packet.sign(&alice.signing_key);
 
         // Bob verifies signature
         packet
-            .verify(&alice.verifying_key)
-            .expect("Signature verification failed");
+            .validate(&alice.verifying_key)
+            .expect("Packet validation failed");
 
         // Bob reconstructs ephemeral public key
         let alice_ephemeral_pub = PublicKey::from(packet.ephemeral_pubkey);
@@ -99,8 +115,16 @@ mod integration_tests {
         let bob_session_key = derive_session_key(&bob.encryption_secret, &alice_ephemeral_pub);
 
         // Bob decrypts
-        let decrypted = decrypt(&bob_session_key, &packet.ciphertext, &packet.nonce)
-            .expect("Decryption failed");
+        // Recompute associated data on Bob side
+        let associated_data = packet.serialize_aad();
+
+        let decrypted = decrypt(
+            &bob_session_key,
+            &packet.ciphertext,
+            &packet.nonce,
+            &associated_data,
+        )
+        .expect("Decryption failed");
 
         assert_eq!(plaintext.to_vec(), decrypted);
     }
