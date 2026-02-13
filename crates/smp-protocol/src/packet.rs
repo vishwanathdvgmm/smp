@@ -28,7 +28,10 @@ pub fn compute_message_id(
     hasher.finalize().into()
 }
 
-#[derive(Clone)]
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SmpPacket {
     pub version: u8,
     pub flags: u8,
@@ -46,6 +49,7 @@ pub struct SmpPacket {
     pub nonce: [u8; 12],
     pub ciphertext: Vec<u8>,
 
+    #[serde(with = "BigArray")]
     pub signature: [u8; 64],
 }
 

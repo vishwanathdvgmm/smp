@@ -10,3 +10,5 @@ x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 sha2 = "0.10"
 bytes = "1"
 thiserror = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
