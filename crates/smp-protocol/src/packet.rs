@@ -165,3 +165,22 @@ impl SmpPacket {
         Ok(())
     }
 }
+
+impl SmpPacket {
+    pub fn serialize_header_for_aad(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        out.push(self.version);
+        out.push(self.flags);
+
+        out.extend_from_slice(&self.prekey_id.to_be_bytes());
+
+        out.extend_from_slice(&self.sender_identity_hash);
+        out.extend_from_slice(&self.recipient_identity_hash);
+
+        out.extend_from_slice(&self.ephemeral_pubkey);
+        out.extend_from_slice(&self.timestamp.to_be_bytes());
+
+        out
+    }
+}

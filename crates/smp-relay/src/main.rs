@@ -1,15 +1,14 @@
 use axum::{
-    routing::{get, post},
-    Router,
     extract::{Path, State},
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
+use smp_protocol::packet::SmpPacket;
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use smp_protocol::packet::SmpPacket;
 
 #[derive(Clone)]
 struct AppState {
@@ -38,10 +37,7 @@ async fn main() {
         .unwrap();
 }
 
-async fn send(
-    State(state): State<AppState>,
-    Json(packet): Json<SmpPacket>,
-) -> String {
+async fn send(State(state): State<AppState>, Json(packet): Json<SmpPacket>) -> String {
     // Basic replay protection (relay-level)
     {
         let mut seen = state.seen_message_ids.lock().unwrap();
@@ -53,10 +49,11 @@ async fn send(
 
     {
         let mut inboxes = state.inboxes.lock().unwrap();
+        let serialized = serde_json::to_vec(&packet).unwrap();
         inboxes
             .entry(packet.recipient_identity_hash)
             .or_default()
-            .push(packet.serialize());
+            .push(serialized);
     }
 
     "Message accepted".into()
