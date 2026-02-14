@@ -3,33 +3,32 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde_json::json;
 use smp_protocol::packet::SmpPacket;
-use std::{
-    collections::{HashMap, HashSet},
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::net::SocketAddr;
 
 #[derive(Clone)]
 struct AppState {
-    // recipient_hash -> Vec<packet_bytes>
-    inboxes: Arc<Mutex<HashMap<[u8; 32], Vec<Vec<u8>>>>>,
-    seen_message_ids: Arc<Mutex<HashSet<[u8; 32]>>>,
+    db: PgPool,
 }
 
 #[tokio::main]
 async fn main() {
-    let state = AppState {
-        inboxes: Arc::new(Mutex::new(HashMap::new())),
-        seen_message_ids: Arc::new(Mutex::new(HashSet::new())),
-    };
+    let db = PgPoolOptions::new()
+        .max_connections(5)
+        .connect("postgres://smp_user:smp_pass@127.0.0.1:5433/smp_db")
+        .await
+        .expect("DB connection failed");
+
+    let state = AppState { db };
 
     let app = Router::new()
         .route("/send", post(send))
         .route("/inbox/:recipient", get(get_inbox))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
     println!("Relay running on http://{}", addr);
 
     axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
@@ -37,26 +36,27 @@ async fn main() {
         .unwrap();
 }
 
-async fn send(State(state): State<AppState>, Json(packet): Json<SmpPacket>) -> String {
-    // Basic replay protection (relay-level)
-    {
-        let mut seen = state.seen_message_ids.lock().unwrap();
-        if seen.contains(&packet.message_id) {
-            return "Duplicate message_id rejected".into();
-        }
-        seen.insert(packet.message_id);
-    }
+async fn send(
+    State(state): State<AppState>,
+    Json(packet): Json<SmpPacket>,
+) -> Json<serde_json::Value> {
+    let serialized = serde_json::to_vec(&packet).unwrap();
 
-    {
-        let mut inboxes = state.inboxes.lock().unwrap();
-        let serialized = serde_json::to_vec(&packet).unwrap();
-        inboxes
-            .entry(packet.recipient_identity_hash)
-            .or_default()
-            .push(serialized);
-    }
+    let res = sqlx::query!(
+        "INSERT INTO messages (message_id, recipient_hash, packet_json, created_at)
+         VALUES ($1, $2, $3, $4)",
+        packet.message_id.as_slice(),
+        packet.recipient_identity_hash.as_slice(),
+        serialized,
+        packet.timestamp as i64
+    )
+    .execute(&state.db)
+    .await;
 
-    "Message accepted".into()
+    match res {
+        Ok(_) => Json(json!({"status": "accepted"})),
+        Err(_) => Json(json!({"status": "duplicate_or_error"})),
+    }
 }
 
 async fn get_inbox(
@@ -64,11 +64,30 @@ async fn get_inbox(
     Path(recipient): Path<String>,
 ) -> Json<Vec<Vec<u8>>> {
     let recipient_bytes = hex::decode(recipient).unwrap();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&recipient_bytes);
 
-    let inboxes = state.inboxes.lock().unwrap();
-    let messages = inboxes.get(&key).cloned().unwrap_or_default();
+    let rows = sqlx::query!(
+        "SELECT message_id, packet_json FROM messages
+         WHERE recipient_hash = $1::bytea",
+        recipient_bytes
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+
+    let mut messages = Vec::new();
+
+    for row in &rows {
+        messages.push(row.packet_json.clone());
+    }
+
+    // Pull-and-delete
+    sqlx::query!(
+        "DELETE FROM messages WHERE recipient_hash = $1::bytea",
+        recipient_bytes
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
 
     Json(messages)
 }
