@@ -28,7 +28,7 @@ async fn main() {
         .route("/inbox/:recipient", get(get_inbox))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("Relay running on http://{}", addr);
 
     axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
