@@ -1,17 +1,25 @@
 use serde::{Deserialize, Serialize};
 use smp_crypto_core::{identity::Identity, prekey::generate_one_time_prekey};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const STORAGE_DIR: &str = ".smp";
 const IDENTITY_FILE: &str = ".smp/identity.json";
 const PREKEY_FILE: &str = ".smp/prekeys.json";
+const SIGNED_PREKEY_FILE: &str = ".smp/signed_prekey.json";
 
 const PREKEY_POOL_SIZE: usize = 20;
 const REFILL_THRESHOLD: usize = 5;
 const REFILL_BATCH: usize = 10;
+
+// 60 seconds for testing rotation
+const SIGNED_PREKEY_TTL: u64 = 60;
 
 #[derive(Serialize, Deserialize)]
 pub struct StoredIdentity {
@@ -29,8 +37,20 @@ pub struct StoredPreKey {
 #[derive(Serialize, Deserialize)]
 pub struct PreKeyPool {
     pub unused: Vec<StoredPreKey>,
-    pub consumed: Vec<u32>,
+    pub used: Vec<StoredPreKey>,
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct SignedPreKey {
+    pub id: u32,
+    pub secret: [u8; 32],
+    pub public: [u8; 32],
+    pub signature: Vec<u8>,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+/* ---------------- Identity ---------------- */
 
 pub fn load_or_create_identity() -> Identity {
     fs::create_dir_all(STORAGE_DIR).unwrap();
@@ -68,6 +88,8 @@ pub fn load_or_create_identity() -> Identity {
     }
 }
 
+/* ---------------- One-Time PreKey Pool ---------------- */
+
 pub fn load_or_create_prekey_pool() -> PreKeyPool {
     fs::create_dir_all(STORAGE_DIR).unwrap();
 
@@ -77,7 +99,7 @@ pub fn load_or_create_prekey_pool() -> PreKeyPool {
     } else {
         let mut pool = PreKeyPool {
             unused: Vec::new(),
-            consumed: Vec::new(),
+            used: Vec::new(),
         };
 
         for _ in 0..PREKEY_POOL_SIZE {
@@ -99,20 +121,14 @@ pub fn take_prekey(pool: &mut PreKeyPool) -> StoredPreKey {
     auto_refill(pool);
 
     let pk = pool.unused.remove(0);
-    pool.consumed.push(pk.id);
+    pool.used.push(pk.clone());
 
     persist_pool(pool);
-
     pk
 }
 
 fn auto_refill(pool: &mut PreKeyPool) {
     if pool.unused.len() < REFILL_THRESHOLD {
-        println!(
-            "PreKey pool low ({} remaining). Refilling...",
-            pool.unused.len()
-        );
-
         for _ in 0..REFILL_BATCH {
             let pk = generate_one_time_prekey();
 
@@ -122,11 +138,62 @@ fn auto_refill(pool: &mut PreKeyPool) {
                 public: *pk.public.as_bytes(),
             });
         }
-
-        println!("PreKey pool refilled.");
     }
 }
 
 fn persist_pool(pool: &PreKeyPool) {
-    fs::write(PREKEY_FILE, serde_json::to_string_pretty(pool).unwrap()).unwrap();
+    fs::write(
+        PREKEY_FILE,
+        serde_json::to_string_pretty(pool).unwrap(),
+    )
+    .unwrap();
+}
+
+/* ---------------- Signed PreKey ---------------- */
+
+pub fn load_or_rotate_signed_prekey(identity: &Identity) -> SignedPreKey {
+    fs::create_dir_all(STORAGE_DIR).unwrap();
+
+    let now = current_time();
+
+    if Path::new(SIGNED_PREKEY_FILE).exists() {
+        let data = fs::read_to_string(SIGNED_PREKEY_FILE).unwrap();
+        let stored: SignedPreKey = serde_json::from_str(&data).unwrap();
+
+        if stored.expires_at > now {
+            return stored;
+        }
+    }
+
+    let new_pk = generate_one_time_prekey();
+
+    let mut message = Vec::new();
+    message.extend_from_slice(&new_pk.id.to_be_bytes());
+    message.extend_from_slice(new_pk.public.as_bytes());
+
+    let signature = identity.signing_key.sign(&message);
+
+    let spk = SignedPreKey {
+        id: new_pk.id,
+        secret: new_pk.secret.to_bytes(),
+        public: *new_pk.public.as_bytes(),
+        signature: signature.to_bytes().to_vec(),
+        created_at: now,
+        expires_at: now + SIGNED_PREKEY_TTL,
+    };
+
+    fs::write(
+        SIGNED_PREKEY_FILE,
+        serde_json::to_string_pretty(&spk).unwrap(),
+    )
+    .unwrap();
+
+    spk
+}
+
+fn current_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }

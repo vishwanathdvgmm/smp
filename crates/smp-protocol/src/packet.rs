@@ -9,6 +9,7 @@ const MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
 const MAX_PACKET_AGE_SECS: u64 = 24 * 60 * 60;
 
 pub const SMP_VERSION: u8 = 1;
+pub const FLAG_USE_SIGNED_PREKEY: u8 = 0x01;
 
 pub fn identity_hash(pubkey_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
