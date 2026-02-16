@@ -9,7 +9,10 @@ reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
-x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+rand = "0.8"
+
+x25519-dalek = "2"
+ed25519-dalek = "2"
 
 smp-crypto-core = { path = "../smp-crypto-core" }
 smp-protocol = { path = "../smp-protocol" }

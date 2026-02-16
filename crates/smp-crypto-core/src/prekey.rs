@@ -11,11 +11,14 @@ pub struct OneTimePreKey {
     pub public: PublicKey,
 }
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
 pub struct PreKeyBundle {
     pub identity_public_key: VerifyingKey,
     pub prekey_id: u32,
     pub prekey_public: PublicKey,
-    pub signature: [u8; 64],
+    pub signature: Signature,
 }
 
 pub fn generate_one_time_prekey() -> OneTimePreKey {
@@ -42,7 +45,7 @@ pub fn create_prekey_bundle(
         identity_public_key: identity_public,
         prekey_id: one_time.id,
         prekey_public: one_time.public,
-        signature: signature.to_bytes(),
+        signature,
     }
 }
 
@@ -52,10 +55,8 @@ pub fn verify_prekey_bundle(bundle: &PreKeyBundle) -> Result<(), CryptoError> {
     message.extend_from_slice(&bundle.prekey_id.to_be_bytes());
     message.extend_from_slice(bundle.prekey_public.as_bytes());
 
-    let signature = Signature::from_bytes(&bundle.signature);
-
     bundle
         .identity_public_key
-        .verify(&message, &signature)
+        .verify(&message, &bundle.signature)
         .map_err(|_| CryptoError::InvalidKey)
 }

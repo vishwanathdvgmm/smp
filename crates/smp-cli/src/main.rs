@@ -2,40 +2,46 @@ use smp_crypto_core::{
     encryption::{decrypt, encrypt},
     handshake::{derive_session_key, generate_ephemeral},
     identity::Identity,
-    prekey::{create_prekey_bundle, generate_one_time_prekey, verify_prekey_bundle},
+    prekey::{create_prekey_bundle, verify_prekey_bundle},
 };
 
-use smp_protocol::packet::{SMP_VERSION, SmpPacket, compute_message_id, identity_hash};
+mod storage;
+use storage::*;
+
+use smp_protocol::packet::{compute_message_id, identity_hash, SmpPacket, SMP_VERSION};
 
 use reqwest::Client;
 use std::time::{SystemTime, UNIX_EPOCH};
-use x25519_dalek::PublicKey;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 #[tokio::main]
 async fn main() {
     let client = Client::new();
 
     // -------------------------
-    // Bob Setup
+    // Bob Setup (Persistent)
     // -------------------------
-    let bob = Identity::generate();
-    let one_time = generate_one_time_prekey();
+    let bob = load_or_create_identity();
+    let mut pool = load_or_create_prekey_pool();
+    let stored_pk = take_prekey(&mut pool);
+
+    let one_time = smp_crypto_core::prekey::OneTimePreKey {
+        id: stored_pk.id,
+        secret: StaticSecret::from(stored_pk.secret),
+        public: PublicKey::from(stored_pk.public),
+    };
 
     let bundle = create_prekey_bundle(&bob.signing_key, bob.verifying_key, &one_time);
-
     verify_prekey_bundle(&bundle).unwrap();
 
     println!("Bob ready.");
-    println!(
-        "Bob recipient hash: {}",
-        hex::encode(identity_hash(bob.verifying_key.as_bytes()))
-    );
+    let recipient_hash = identity_hash(bob.verifying_key.as_bytes());
+    println!("Bob recipient hash: {}", hex::encode(recipient_hash));
 
     // -------------------------
     // Alice Sends Message
     // -------------------------
     let alice = Identity::generate();
-
     let eph = generate_ephemeral();
 
     let alice_session_key = derive_session_key(&eph.secret, &bundle.prekey_public);
@@ -48,7 +54,7 @@ async fn main() {
         message_id: [0u8; 32],
         prekey_id: bundle.prekey_id,
         sender_identity_hash: identity_hash(alice.verifying_key.as_bytes()),
-        recipient_identity_hash: identity_hash(bob.verifying_key.as_bytes()),
+        recipient_identity_hash: recipient_hash,
         ephemeral_pubkey: eph.public.to_bytes(),
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -87,7 +93,7 @@ async fn main() {
     // -------------------------
     // Bob Fetches
     // -------------------------
-    let recipient_hex = hex::encode(identity_hash(bob.verifying_key.as_bytes()));
+    let recipient_hex = hex::encode(recipient_hash);
 
     let messages: Vec<Vec<u8>> = client
         .get(format!("http://127.0.0.1:3000/inbox/{}", recipient_hex))
@@ -121,4 +127,16 @@ async fn main() {
 
         println!("Bob decrypted: {}", String::from_utf8(decrypted).unwrap());
     }
+
+    // Fetch again (pull-and-delete check)
+    let messages_again: Vec<Vec<u8>> = client
+        .get(format!("http://127.0.0.1:3000/inbox/{}", recipient_hex))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    println!("Bob received again: {} message(s)", messages_again.len());
 }

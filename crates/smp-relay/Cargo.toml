@@ -11,4 +11,5 @@ serde_json = "1"
 hex = "0.4"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "macros"] }
 smp-protocol = { path = "../smp-protocol" }
+smp-crypto-core = { path = "../smp-crypto-core" }
 bytes = "1"

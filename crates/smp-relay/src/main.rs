@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
+use smp_crypto_core::prekey::PreKeyBundle;
 use smp_protocol::packet::SmpPacket;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::net::SocketAddr;
@@ -26,6 +27,8 @@ async fn main() {
     let app = Router::new()
         .route("/send", post(send))
         .route("/inbox/:recipient", get(get_inbox))
+        .route("/prekey", post(upload_prekey))
+        .route("/prekey/:recipient", get(fetch_prekey))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
@@ -67,7 +70,7 @@ async fn get_inbox(
 
     let rows = sqlx::query!(
         "SELECT message_id, packet_json FROM messages
-         WHERE recipient_hash = $1::bytea",
+         WHERE recipient_hash = $1",
         recipient_bytes
     )
     .fetch_all(&state.db)
@@ -80,9 +83,8 @@ async fn get_inbox(
         messages.push(row.packet_json.clone());
     }
 
-    // Pull-and-delete
     sqlx::query!(
-        "DELETE FROM messages WHERE recipient_hash = $1::bytea",
+        "DELETE FROM messages WHERE recipient_hash = $1",
         recipient_bytes
     )
     .execute(&state.db)
@@ -90,4 +92,47 @@ async fn get_inbox(
     .unwrap();
 
     Json(messages)
+}
+
+async fn upload_prekey(
+    State(state): State<AppState>,
+    Json(bundle): Json<PreKeyBundle>,
+) -> Json<serde_json::Value> {
+    let recipient_hash = smp_protocol::packet::identity_hash(bundle.identity_public_key.as_bytes());
+
+    let serialized = serde_json::to_vec(&bundle).unwrap();
+
+    sqlx::query!(
+        "INSERT INTO prekeys (recipient_hash, bundle_json, updated_at)
+         VALUES ($1, $2, EXTRACT(EPOCH FROM NOW())::BIGINT)
+         ON CONFLICT (recipient_hash)
+         DO UPDATE SET bundle_json = $2, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT",
+        recipient_hash.as_slice(),
+        serialized
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    Json(json!({"status": "prekey_uploaded"}))
+}
+
+async fn fetch_prekey(
+    State(state): State<AppState>,
+    Path(recipient): Path<String>,
+) -> Json<Option<Vec<u8>>> {
+    let recipient_bytes = hex::decode(recipient).unwrap();
+
+    let row = sqlx::query!(
+        "SELECT bundle_json FROM prekeys WHERE recipient_hash = $1",
+        recipient_bytes
+    )
+    .fetch_optional(&state.db)
+    .await
+    .unwrap();
+
+    match row {
+        Some(r) => Json(Some(r.bundle_json)),
+        None => Json(None),
+    }
 }
