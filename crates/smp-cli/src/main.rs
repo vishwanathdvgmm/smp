@@ -3,6 +3,7 @@ use smp_crypto_core::{
     handshake::{derive_session_key, generate_ephemeral},
     identity::Identity,
     prekey::{create_prekey_bundle, verify_prekey_bundle, PreKeyBundle},
+    ratchet::RatchetState,
 };
 
 mod storage;
@@ -28,7 +29,7 @@ async fn main() {
     let recipient_hash = identity_hash(bob.verifying_key.as_bytes());
     let recipient_hex = hex::encode(recipient_hash);
 
-    // Rotate / load SPK
+    // Rotate / load Signed PreKey
     let spk = load_or_rotate_signed_prekey(&bob);
 
     client
@@ -71,7 +72,6 @@ async fn main() {
 
     /* ---------------- Alice Fetch ---------------- */
 
-    // Try OPK first
     let fetched_opk: Option<Vec<u8>> = client
         .get(format!("http://127.0.0.1:3000/prekey/{}", recipient_hex))
         .send()
@@ -95,7 +95,6 @@ async fn main() {
         prekey_id = bundle.prekey_id;
         peer_public = bundle.prekey_public;
     } else {
-        // Fallback to SPK
         let fetched_spk: Option<Vec<u8>> = client
             .get(format!(
                 "http://127.0.0.1:3000/signed_prekey/{}",
@@ -133,7 +132,11 @@ async fn main() {
     let alice = Identity::generate();
     let eph = generate_ephemeral();
 
-    let alice_session_key = derive_session_key(&eph.secret, &peer_public);
+    let shared_secret = derive_session_key(&eph.secret, &peer_public);
+
+    let mut alice_ratchet = RatchetState::initialize(&shared_secret);
+
+    let (message_key, msg_number) = alice_ratchet.next_sending_key();
 
     let plaintext = b"Hello Bob over network!";
 
@@ -142,6 +145,7 @@ async fn main() {
         flags: if using_spk { FLAG_USE_SIGNED_PREKEY } else { 0 },
         message_id: [0u8; 32],
         prekey_id,
+        message_number: msg_number,
         sender_identity_hash: identity_hash(alice.verifying_key.as_bytes()),
         recipient_identity_hash: recipient_hash,
         ephemeral_pubkey: eph.public.to_bytes(),
@@ -156,7 +160,7 @@ async fn main() {
 
     let associated_data = packet.serialize_header_for_aad();
 
-    let (ciphertext, nonce) = encrypt(&alice_session_key, plaintext, &associated_data).unwrap();
+    let (ciphertext, nonce) = encrypt(&message_key, plaintext, &associated_data).unwrap();
 
     packet.nonce = nonce;
     packet.ciphertext = ciphertext;
@@ -212,12 +216,16 @@ async fn main() {
             StaticSecret::from(matching.secret)
         };
 
-        let bob_session_key = derive_session_key(&bob_secret, &alice_ephemeral_pub);
+        let shared_secret = derive_session_key(&bob_secret, &alice_ephemeral_pub);
+
+        let mut bob_ratchet = RatchetState::initialize(&shared_secret);
+
+        let message_key = bob_ratchet.receive_key(packet.message_number);
 
         let associated_data = packet.serialize_header_for_aad();
 
         let decrypted = decrypt(
-            &bob_session_key,
+            &message_key,
             &packet.ciphertext,
             &packet.nonce,
             &associated_data,

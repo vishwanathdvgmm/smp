@@ -40,6 +40,7 @@ pub struct SmpPacket {
     pub message_id: [u8; 32],
 
     pub prekey_id: u32,
+    pub message_number: u32,
 
     pub sender_identity_hash: [u8; 32],
     pub recipient_identity_hash: [u8; 32],
@@ -63,6 +64,7 @@ impl SmpPacket {
 
         out.extend_from_slice(&self.message_id);
         out.extend_from_slice(&self.prekey_id.to_be_bytes());
+        out.extend_from_slice(&self.message_number.to_be_bytes());
 
         out.extend_from_slice(&self.sender_identity_hash);
         out.extend_from_slice(&self.recipient_identity_hash);
@@ -175,6 +177,7 @@ impl SmpPacket {
         out.push(self.flags);
 
         out.extend_from_slice(&self.prekey_id.to_be_bytes());
+        out.extend_from_slice(&self.message_number.to_be_bytes());
 
         out.extend_from_slice(&self.sender_identity_hash);
         out.extend_from_slice(&self.recipient_identity_hash);

@@ -80,6 +80,7 @@ mod integration_tests {
 
             message_id: [0u8; 32],
             prekey_id: bundle.prekey_id,
+            message_number: 0,
 
             sender_identity_hash: identity_hash(alice.verifying_key.as_bytes()),
             recipient_identity_hash: identity_hash(bob.verifying_key.as_bytes()),
