@@ -1,13 +1,12 @@
 use axum::{
-    routing::{get, post},
-    Router,
     extract::{Path, State},
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use serde_json::json;
-use smp_protocol::packet::SmpPacket;
 use smp_crypto_core::prekey::PreKeyBundle;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use smp_protocol::packet::SmpPacket;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::net::SocketAddr;
 
 #[derive(Clone)]
@@ -104,8 +103,7 @@ async fn upload_prekey(
     State(state): State<AppState>,
     Json(bundle): Json<PreKeyBundle>,
 ) -> Json<serde_json::Value> {
-    let recipient_hash =
-        smp_protocol::packet::identity_hash(bundle.identity_public_key.as_bytes());
+    let recipient_hash = smp_protocol::packet::identity_hash(bundle.identity_public_key.as_bytes());
 
     let serialized = serde_json::to_vec(&bundle).unwrap();
 
@@ -165,14 +163,14 @@ async fn upload_signed_prekey(
     State(state): State<AppState>,
     Json(spk): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let identity_public =
-        spk["identity_public_key"].as_array().unwrap();
+    let identity_public = spk["identity_public_key"].as_array().unwrap();
 
-    let identity_bytes: Vec<u8> =
-        identity_public.iter().map(|v| v.as_u64().unwrap() as u8).collect();
+    let identity_bytes: Vec<u8> = identity_public
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u8)
+        .collect();
 
-    let recipient_hash =
-        smp_protocol::packet::identity_hash(&identity_bytes);
+    let recipient_hash = smp_protocol::packet::identity_hash(&identity_bytes);
 
     let serialized = serde_json::to_vec(&spk).unwrap();
 

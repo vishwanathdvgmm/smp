@@ -9,7 +9,7 @@ use std::{
 use ed25519_dalek::{Signer, SigningKey};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const STORAGE_DIR: &str = ".smp";
+pub const STORAGE_DIR: &str = ".smp";
 const IDENTITY_FILE: &str = ".smp/identity.json";
 const PREKEY_FILE: &str = ".smp/prekeys.json";
 const SIGNED_PREKEY_FILE: &str = ".smp/signed_prekey.json";
@@ -142,11 +142,7 @@ fn auto_refill(pool: &mut PreKeyPool) {
 }
 
 fn persist_pool(pool: &PreKeyPool) {
-    fs::write(
-        PREKEY_FILE,
-        serde_json::to_string_pretty(pool).unwrap(),
-    )
-    .unwrap();
+    fs::write(PREKEY_FILE, serde_json::to_string_pretty(pool).unwrap()).unwrap();
 }
 
 /* ---------------- Signed PreKey ---------------- */

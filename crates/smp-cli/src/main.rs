@@ -3,11 +3,14 @@ use smp_crypto_core::{
     handshake::{derive_session_key, generate_ephemeral},
     identity::Identity,
     prekey::{create_prekey_bundle, verify_prekey_bundle, PreKeyBundle},
-    ratchet::RatchetState,
+    ratchet::DoubleRatchet,
 };
 
 mod storage;
 use storage::*;
+
+mod session_store;
+use session_store::*;
 
 use smp_protocol::packet::{
     compute_message_id, identity_hash, SmpPacket, FLAG_USE_SIGNED_PREKEY, SMP_VERSION,
@@ -29,7 +32,10 @@ async fn main() {
     let recipient_hash = identity_hash(bob.verifying_key.as_bytes());
     let recipient_hex = hex::encode(recipient_hash);
 
-    // Rotate / load Signed PreKey
+    // Session keys MUST be separated per role
+    let alice_session_key = format!("alice_{}", recipient_hex);
+    let bob_session_key = format!("bob_{}", recipient_hex);
+
     let spk = load_or_rotate_signed_prekey(&bob);
 
     client
@@ -87,7 +93,6 @@ async fn main() {
 
     if let Some(bytes) = fetched_opk {
         let bundle: PreKeyBundle = serde_json::from_slice(&bytes).unwrap();
-
         verify_prekey_bundle(&bundle).unwrap();
 
         println!("Alice using OPK.");
@@ -108,7 +113,6 @@ async fn main() {
             .unwrap();
 
         let spk_json = fetched_spk.expect("No Signed PreKey found");
-
         let spk_value: serde_json::Value = serde_json::from_slice(&spk_json).unwrap();
 
         prekey_id = spk_value["prekey_id"].as_u64().unwrap() as u32;
@@ -121,7 +125,6 @@ async fn main() {
             .collect();
 
         peer_public = PublicKey::from(<[u8; 32]>::try_from(public_vec).unwrap());
-
         using_spk = true;
 
         println!("Alice using Signed PreKey fallback.");
@@ -133,10 +136,12 @@ async fn main() {
     let eph = generate_ephemeral();
 
     let shared_secret = derive_session_key(&eph.secret, &peer_public);
+    println!("Alice shared: {}", hex::encode(shared_secret));
 
-    let mut alice_ratchet = RatchetState::initialize(&shared_secret);
+    let mut alice_ratchet =
+        load_session(&alice_session_key).unwrap_or_else(|| DoubleRatchet::new(shared_secret));
 
-    let (message_key, msg_number) = alice_ratchet.next_sending_key();
+    let (message_key, msg_number) = alice_ratchet.next_sending_key().unwrap();
 
     let plaintext = b"Hello Bob over network!";
 
@@ -146,6 +151,7 @@ async fn main() {
         message_id: [0u8; 32],
         prekey_id,
         message_number: msg_number,
+        dh_ratchet_pub: None,
         sender_identity_hash: identity_hash(alice.verifying_key.as_bytes()),
         recipient_identity_hash: recipient_hash,
         ephemeral_pubkey: eph.public.to_bytes(),
@@ -180,6 +186,8 @@ async fn main() {
         .await
         .unwrap();
 
+    save_session(&alice_session_key, &alice_ratchet);
+
     println!("Alice sent encrypted message.");
 
     /* ---------------- Bob Fetch ---------------- */
@@ -197,7 +205,6 @@ async fn main() {
 
     if let Some(raw) = messages.first() {
         let packet: SmpPacket = serde_json::from_slice(raw).unwrap();
-
         packet.validate(&alice.verifying_key).unwrap();
 
         let alice_ephemeral_pub = PublicKey::from(packet.ephemeral_pubkey);
@@ -207,20 +214,24 @@ async fn main() {
             StaticSecret::from(spk.secret)
         } else {
             println!("Bob decrypting via OPK.");
+
             let pool = load_or_create_prekey_pool();
             let matching = pool
                 .used
                 .iter()
                 .find(|p| p.id == packet.prekey_id)
                 .expect("Matching OPK not found");
+
             StaticSecret::from(matching.secret)
         };
 
         let shared_secret = derive_session_key(&bob_secret, &alice_ephemeral_pub);
+        println!("Bob shared: {}", hex::encode(shared_secret));
 
-        let mut bob_ratchet = RatchetState::initialize(&shared_secret);
+        let mut bob_ratchet =
+            load_session(&bob_session_key).unwrap_or_else(|| DoubleRatchet::new(shared_secret));
 
-        let message_key = bob_ratchet.receive_key(packet.message_number);
+        let message_key = bob_ratchet.receive_key(packet.message_number).unwrap();
 
         let associated_data = packet.serialize_header_for_aad();
 
@@ -231,6 +242,8 @@ async fn main() {
             &associated_data,
         )
         .unwrap();
+
+        save_session(&bob_session_key, &bob_ratchet);
 
         println!("Bob decrypted: {}", String::from_utf8(decrypted).unwrap());
     }
