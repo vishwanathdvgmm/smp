@@ -2,132 +2,207 @@ use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::error::CryptoError;
 
 const MAX_SKIP: u32 = 1000;
+const MAX_STORED_SKIPPED: usize = 200;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct DoubleRatchet {
-    // Root key from X3DH / initial handshake
     pub root_key: [u8; 32],
 
-    // Sending & receiving chain keys
+    pub dh_self_secret: [u8; 32],
+    pub dh_self_public: [u8; 32],
+    pub dh_remote_public: Option<[u8; 32]>,
+
     pub chain_key_send: Option<[u8; 32]>,
     pub chain_key_recv: Option<[u8; 32]>,
 
-    // Message counters
-    pub ns: u32, // number sent
-    pub nr: u32, // number received
+    pub ns: u32,
+    pub nr: u32,
+    pub pn: u32,
 
-    // Skipped message keys (for out-of-order delivery)
+    #[zeroize(skip)]
     pub skipped_keys: HashMap<u32, [u8; 32]>,
 }
 
 impl DoubleRatchet {
-    // =============================
-    // Initialization
-    // =============================
+    /* ================= INITIALIZATION ================= */
 
     pub fn new(shared_secret: [u8; 32]) -> Self {
-        // Derive initial send & receive chains from shared secret
-        let (initial_chain, _) = Self::kdf_chain(&shared_secret);
+        let dh_secret = StaticSecret::random();
+        let dh_public = PublicKey::from(&dh_secret);
 
         Self {
             root_key: shared_secret,
-            chain_key_send: Some(initial_chain),
-            chain_key_recv: Some(initial_chain),
+            dh_self_secret: dh_secret.to_bytes(),
+            dh_self_public: dh_public.to_bytes(),
+            dh_remote_public: None,
+            chain_key_send: None,
+            chain_key_recv: None,
             ns: 0,
             nr: 0,
+            pn: 0,
             skipped_keys: HashMap::new(),
         }
     }
 
-    // =============================
-    // HKDF Root Derivation
-    // =============================
+    /* ================= KDF ================= */
 
-    #[allow(dead_code)]
-    fn kdf_root(root_key: &[u8; 32], dh_output: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    fn kdf_root(
+        root_key: &[u8; 32],
+        dh_output: &[u8; 32],
+    ) -> Result<([u8; 32], [u8; 32]), CryptoError> {
         let hk = Hkdf::<Sha256>::new(Some(root_key), dh_output);
 
         let mut new_root = [0u8; 32];
         let mut new_chain = [0u8; 32];
 
         hk.expand(b"SMP_ROOT", &mut new_root)
-            .expect("HKDF root expand failed");
+            .map_err(|_| CryptoError::InvalidKey)?;
         hk.expand(b"SMP_CHAIN", &mut new_chain)
-            .expect("HKDF chain expand failed");
+            .map_err(|_| CryptoError::InvalidKey)?;
 
-        (new_root, new_chain)
+        Ok((new_root, new_chain))
     }
 
-    // =============================
-    // HKDF Chain Derivation
-    // =============================
-
-    fn kdf_chain(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    fn kdf_chain(chain_key: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), CryptoError> {
         let hk = Hkdf::<Sha256>::new(None, chain_key);
 
         let mut new_chain = [0u8; 32];
         let mut message_key = [0u8; 32];
 
         hk.expand(b"SMP_CHAIN_NEXT", &mut new_chain)
-            .expect("HKDF chain next failed");
+            .map_err(|_| CryptoError::InvalidKey)?;
         hk.expand(b"SMP_MESSAGE_KEY", &mut message_key)
-            .expect("HKDF message key failed");
+            .map_err(|_| CryptoError::InvalidKey)?;
 
-        (new_chain, message_key)
+        Ok((new_chain, message_key))
     }
 
-    // =============================
-    // Sending Key
-    // =============================
+    /* ================= DH RATCHET STEP ================= */
 
-    pub fn next_sending_key(&mut self) -> Result<([u8; 32], u32), String> {
-        let ck = self.chain_key_send.ok_or("Send chain not initialized")?;
+    pub fn dh_ratchet_step(&mut self, remote_pub: [u8; 32]) -> Result<(), CryptoError> {
+        let remote = PublicKey::from(remote_pub);
+        let self_secret = StaticSecret::from(self.dh_self_secret);
 
-        let (new_ck, mk) = Self::kdf_chain(&ck);
+        // Step 1: derive new recv chain
+        let dh1 = self_secret.diffie_hellman(&remote).to_bytes();
+        let (new_root, new_recv_chain) = Self::kdf_root(&self.root_key, &dh1)?;
+
+        self.root_key = new_root;
+        self.chain_key_recv = Some(new_recv_chain);
+
+        self.pn = self.ns;
+        self.ns = 0;
+        self.nr = 0;
+
+        self.dh_remote_public = Some(remote_pub);
+
+        // Step 2: generate new DH keypair
+        let new_secret = StaticSecret::random();
+        let new_public = PublicKey::from(&new_secret);
+
+        self.dh_self_secret = new_secret.to_bytes();
+        self.dh_self_public = new_public.to_bytes();
+
+        // Step 3: derive new send chain
+        let dh2 = new_secret.diffie_hellman(&remote).to_bytes();
+        let (new_root2, new_send_chain) = Self::kdf_root(&self.root_key, &dh2)?;
+
+        self.root_key = new_root2;
+        self.chain_key_send = Some(new_send_chain);
+
+        Ok(())
+    }
+
+    pub fn init_sender(&mut self, remote_pub: [u8; 32]) -> Result<(), CryptoError> {
+        let remote = PublicKey::from(remote_pub);
+        let self_secret = StaticSecret::from(self.dh_self_secret);
+
+        let dh = self_secret.diffie_hellman(&remote).to_bytes();
+        let (new_root, send_chain) = Self::kdf_root(&self.root_key, &dh)?;
+
+        self.root_key = new_root;
+        self.chain_key_send = Some(send_chain);
+        self.dh_remote_public = Some(remote_pub);
+
+        Ok(())
+    }
+
+    pub fn bootstrap_as_receiver(
+        &mut self,
+        self_secret_bytes: [u8; 32],
+        remote_pub: [u8; 32],
+    ) -> Result<(), CryptoError> {
+        let self_secret = StaticSecret::from(self_secret_bytes);
+        let remote = PublicKey::from(remote_pub);
+
+        self.dh_self_secret = self_secret_bytes;
+        self.dh_self_public = PublicKey::from(&self_secret).to_bytes();
+
+        let dh = self_secret.diffie_hellman(&remote).to_bytes();
+        let (new_root, recv_chain) = Self::kdf_root(&self.root_key, &dh)?;
+
+        self.root_key = new_root;
+        self.chain_key_recv = Some(recv_chain);
+        self.dh_remote_public = Some(remote_pub);
+
+        Ok(())
+    }
+
+    /* ================= SENDING ================= */
+
+    pub fn next_sending_key(&mut self) -> Result<([u8; 32], u32), CryptoError> {
+        let ck = self.chain_key_send.ok_or(CryptoError::InvalidKey)?;
+
+        let (new_ck, mk) = Self::kdf_chain(&ck)?;
 
         self.chain_key_send = Some(new_ck);
+
         let msg_number = self.ns;
         self.ns += 1;
 
         Ok((mk, msg_number))
     }
 
-    // =============================
-    // Receiving Key
-    // =============================
+    /* ================= RECEIVING ================= */
 
-    pub fn receive_key(&mut self, message_number: u32) -> Result<[u8; 32], String> {
-        // Replay protection
+    pub fn receive_key(&mut self, message_number: u32) -> Result<[u8; 32], CryptoError> {
         if message_number < self.nr {
             if let Some(key) = self.skipped_keys.remove(&message_number) {
                 return Ok(key);
             }
-            return Err("Replay detected".into());
+            return Err(CryptoError::InvalidKey);
         }
 
-        // Skip window protection
         if message_number - self.nr > MAX_SKIP {
-            return Err("Ratchet window exceeded".into());
+            return Err(CryptoError::InvalidKey);
         }
 
-        // Advance chain to target message
         while self.nr < message_number {
-            let ck = self.chain_key_recv.ok_or("Recv chain not initialized")?;
+            let ck = self.chain_key_recv.ok_or(CryptoError::InvalidKey)?;
 
-            let (new_ck, mk) = Self::kdf_chain(&ck);
+            let (new_ck, mk) = Self::kdf_chain(&ck)?;
 
             self.chain_key_recv = Some(new_ck);
-            self.skipped_keys.insert(self.nr + 1, mk);
 
+            if self.skipped_keys.len() >= MAX_STORED_SKIPPED {
+                if let Some(first_key) = self.skipped_keys.keys().next().cloned() {
+                    self.skipped_keys.remove(&first_key);
+                }
+            }
+
+            self.skipped_keys.insert(self.nr, mk);
             self.nr += 1;
         }
 
-        // Derive actual message key
-        let ck = self.chain_key_recv.ok_or("Recv chain not initialized")?;
+        let ck = self.chain_key_recv.ok_or(CryptoError::InvalidKey)?;
 
-        let (new_ck, mk) = Self::kdf_chain(&ck);
+        let (new_ck, mk) = Self::kdf_chain(&ck)?;
 
         self.chain_key_recv = Some(new_ck);
         self.nr += 1;

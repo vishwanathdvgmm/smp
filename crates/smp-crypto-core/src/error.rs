@@ -10,4 +10,7 @@ pub enum CryptoError {
 
     #[error("Invalid key material")]
     InvalidKey,
+
+    #[error("HKDF expansion failed")]
+    KdfFailed,
 }

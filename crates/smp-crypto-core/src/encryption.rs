@@ -19,10 +19,13 @@ pub fn encrypt(
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, chacha20poly1305::aead::Payload {
-            msg: plaintext,
-            aad: associated_data,
-        })
+        .encrypt(
+            nonce,
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad: associated_data,
+            },
+        )
         .map_err(|_| CryptoError::EncryptionFailed)?;
 
     Ok((ciphertext, nonce_bytes))
@@ -40,9 +43,12 @@ pub fn decrypt(
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher
-        .decrypt(nonce, chacha20poly1305::aead::Payload {
-            msg: ciphertext,
-            aad: associated_data,
-        })
+        .decrypt(
+            nonce,
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: associated_data,
+            },
+        )
         .map_err(|_| CryptoError::DecryptionFailed)
 }

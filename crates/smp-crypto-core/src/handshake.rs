@@ -1,7 +1,9 @@
 use hkdf::Hkdf;
+use rand::rngs::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
-use rand::rngs::OsRng;
+
+use crate::error::CryptoError;
 
 pub struct EphemeralKeyPair {
     pub secret: StaticSecret,
@@ -19,13 +21,13 @@ pub fn generate_ephemeral() -> EphemeralKeyPair {
 pub fn derive_session_key(
     my_secret: &StaticSecret,
     their_public: &PublicKey,
-) -> [u8; 32] {
+) -> Result<[u8; 32], CryptoError> {
     let shared = my_secret.diffie_hellman(their_public);
 
     let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
     let mut okm = [0u8; 32];
     hk.expand(b"smp-session-key", &mut okm)
-        .expect("HKDF expand failed");
+        .map_err(|_| CryptoError::KdfFailed)?;
 
-    okm
+    Ok(okm)
 }

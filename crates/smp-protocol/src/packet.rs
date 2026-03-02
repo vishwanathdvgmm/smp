@@ -9,6 +9,7 @@ const MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
 const MAX_PACKET_AGE_SECS: u64 = 24 * 60 * 60;
 
 pub const SMP_VERSION: u8 = 1;
+pub const FLAG_ACK: u8 = 0x02;
 pub const FLAG_USE_SIGNED_PREKEY: u8 = 0x01;
 
 pub fn identity_hash(pubkey_bytes: &[u8]) -> [u8; 32] {
@@ -44,6 +45,7 @@ pub struct SmpPacket {
     pub dh_ratchet_pub: Option<[u8; 32]>,
 
     pub sender_identity_hash: [u8; 32],
+    pub sender_verifying_key: [u8; 32],
     pub recipient_identity_hash: [u8; 32],
 
     pub ephemeral_pubkey: [u8; 32],
@@ -76,6 +78,7 @@ impl SmpPacket {
             }
         }
         out.extend_from_slice(&self.sender_identity_hash);
+        out.extend_from_slice(&self.sender_verifying_key);
         out.extend_from_slice(&self.recipient_identity_hash);
         out.extend_from_slice(&self.ephemeral_pubkey);
 
@@ -199,6 +202,7 @@ impl SmpPacket {
         }
 
         out.extend_from_slice(&self.sender_identity_hash);
+        out.extend_from_slice(&self.sender_verifying_key);
         out.extend_from_slice(&self.recipient_identity_hash);
 
         out.extend_from_slice(&self.ephemeral_pubkey);

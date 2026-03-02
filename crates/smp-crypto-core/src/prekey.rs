@@ -1,9 +1,11 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
-use rand::Rng;
+use std::sync::atomic::{AtomicU32, Ordering};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::error::CryptoError;
+
+static PREKEY_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 pub struct OneTimePreKey {
     pub id: u32,
@@ -25,7 +27,7 @@ pub fn generate_one_time_prekey() -> OneTimePreKey {
     let mut rng = OsRng;
     let secret = StaticSecret::random_from_rng(&mut rng);
     let public = PublicKey::from(&secret);
-    let id = rand::thread_rng().gen::<u32>();
+    let id = PREKEY_COUNTER.fetch_add(1, Ordering::Relaxed);
 
     OneTimePreKey { id, secret, public }
 }
