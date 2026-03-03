@@ -1,18 +1,25 @@
 use serde::{Deserialize, Serialize};
-use smp_crypto_core::{identity::Identity, prekey::generate_one_time_prekey};
+use smp_crypto_core::{
+    encryption::{decrypt, encrypt},
+    identity::Identity,
+    prekey::generate_one_time_prekey,
+};
 use std::{
-    fs,
+    fs::{self, File},
+    io::Write,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use ed25519_dalek::{Signer, SigningKey};
+use rand_core::{OsRng, RngCore};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const PREKEY_POOL_SIZE: usize = 20;
 const REFILL_THRESHOLD: usize = 5;
 const REFILL_BATCH: usize = 10;
-const SIGNED_PREKEY_TTL: u64 = 60;
+const SIGNED_PREKEY_TTL: u64 = 60 * 60 * 24;
+const MASTER_KEY_FILE: &str = "master.key";
 
 /* ================= PATH HELPERS ================= */
 
@@ -30,6 +37,91 @@ fn prekey_path(user: &str) -> String {
 
 fn signed_prekey_path(user: &str) -> String {
     format!("{}/signed_prekey.json", storage_dir(user))
+}
+
+fn master_key_path(user: &str) -> String {
+    format!("{}/{}", storage_dir(user), MASTER_KEY_FILE)
+}
+
+/* ================= MASTER KEY ================= */
+
+fn load_or_create_master_key(user: &str) -> Option<[u8; 32]> {
+    let dir = storage_dir(user);
+    if fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+
+    let path = master_key_path(user);
+
+    if Path::new(&path).exists() {
+        let data = fs::read(&path).ok()?;
+        if data.len() != 32 {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&data);
+        return Some(key);
+    }
+
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+
+    if fs::write(&path, &key).is_err() {
+        return None;
+    }
+
+    Some(key)
+}
+
+/* ================= ENCRYPTED FILE HELPERS ================= */
+
+fn encrypted_write(user: &str, path: String, plaintext: &[u8]) -> bool {
+    let key = match load_or_create_master_key(user) {
+        Some(k) => k,
+        None => return false,
+    };
+
+    let (ciphertext, nonce) = match encrypt(&key, plaintext, b"storage-file") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let mut stored = nonce.to_vec();
+    stored.extend_from_slice(&ciphertext);
+
+    let tmp_path = format!("{}.tmp", path);
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(&stored)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        return false;
+    }
+
+    if fs::rename(&tmp_path, &path).is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return false;
+    }
+
+    true
+}
+
+fn encrypted_read(user: &str, path: String) -> Option<Vec<u8>> {
+    let key = load_or_create_master_key(user)?;
+    let data = fs::read(&path).ok()?;
+
+    if data.len() < 12 {
+        return None;
+    }
+
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&data[..12]);
+
+    decrypt(&key, &data[12..], &nonce, b"storage-file").ok()
 }
 
 /* ================= DATA STRUCTS ================= */
@@ -67,77 +159,78 @@ pub struct SignedPreKey {
 
 pub fn load_or_create_identity(user: &str) -> Identity {
     let dir = storage_dir(user);
-    fs::create_dir_all(&dir).unwrap();
+    let _ = fs::create_dir_all(&dir);
 
     let path = identity_path(user);
 
     if Path::new(&path).exists() {
-        let data = fs::read_to_string(path).unwrap();
-        let stored: StoredIdentity = serde_json::from_str(&data).unwrap();
+        if let Some(decrypted) = encrypted_read(user, path.clone()) {
+            if let Ok(stored) = serde_json::from_slice::<StoredIdentity>(&decrypted) {
+                let signing_key = SigningKey::from_bytes(&stored.signing_key);
+                let verifying_key = signing_key.verifying_key();
+                let encryption_secret = StaticSecret::from(stored.encryption_secret);
+                let encryption_public = PublicKey::from(&encryption_secret);
 
-        let signing_key = SigningKey::from_bytes(&stored.signing_key);
-        let verifying_key = signing_key.verifying_key();
-
-        let encryption_secret = StaticSecret::from(stored.encryption_secret);
-        let encryption_public = PublicKey::from(&encryption_secret);
-
-        Identity {
-            signing_key,
-            verifying_key,
-            encryption_secret,
-            encryption_public,
+                return Identity {
+                    signing_key,
+                    verifying_key,
+                    encryption_secret,
+                    encryption_public,
+                };
+            }
         }
-    } else {
-        let identity = Identity::generate();
-
-        let stored = StoredIdentity {
-            signing_key: identity.signing_key.to_bytes(),
-            encryption_secret: identity.encryption_secret.to_bytes(),
-        };
-
-        fs::write(&path, serde_json::to_string_pretty(&stored).unwrap()).unwrap();
-
-        identity
     }
+
+    let identity = Identity::generate();
+
+    let stored = StoredIdentity {
+        signing_key: identity.signing_key.to_bytes(),
+        encryption_secret: identity.encryption_secret.to_bytes(),
+    };
+
+    if let Ok(json) = serde_json::to_vec(&stored) {
+        let _ = encrypted_write(user, path, &json);
+    }
+
+    identity
 }
 
 /* ================= PREKEY POOL ================= */
 
 pub fn load_or_create_prekey_pool(user: &str) -> PreKeyPool {
-    let dir = storage_dir(user);
-    fs::create_dir_all(&dir).unwrap();
-
+    let _ = fs::create_dir_all(storage_dir(user));
     let path = prekey_path(user);
 
     if Path::new(&path).exists() {
-        let data = fs::read_to_string(path).unwrap();
-        serde_json::from_str(&data).unwrap()
-    } else {
-        let mut pool = PreKeyPool {
-            unused: Vec::new(),
-            used: Vec::new(),
-        };
-
-        for _ in 0..PREKEY_POOL_SIZE {
-            let pk = generate_one_time_prekey();
-            pool.unused.push(StoredPreKey {
-                id: pk.id,
-                secret: pk.secret.to_bytes(),
-                public: *pk.public.as_bytes(),
-            });
+        if let Some(decrypted) = encrypted_read(user, path.clone()) {
+            if let Ok(pool) = serde_json::from_slice::<PreKeyPool>(&decrypted) {
+                return pool;
+            }
         }
-
-        persist_pool(user, &pool);
-        pool
     }
+
+    let mut pool = PreKeyPool {
+        unused: Vec::new(),
+        used: Vec::new(),
+    };
+
+    for _ in 0..PREKEY_POOL_SIZE {
+        let pk = generate_one_time_prekey();
+        pool.unused.push(StoredPreKey {
+            id: pk.id,
+            secret: pk.secret.to_bytes(),
+            public: *pk.public.as_bytes(),
+        });
+    }
+
+    persist_pool(user, &pool);
+    pool
 }
 
 pub fn take_prekey(user: &str, pool: &mut PreKeyPool) -> StoredPreKey {
     auto_refill(pool);
-
     let pk = pool.unused.remove(0);
     pool.used.push(pk.clone());
-
     persist_pool(user, pool);
     pk
 }
@@ -156,28 +249,27 @@ fn auto_refill(pool: &mut PreKeyPool) {
 }
 
 fn persist_pool(user: &str, pool: &PreKeyPool) {
-    fs::write(
-        prekey_path(user),
-        serde_json::to_string_pretty(pool).unwrap(),
-    )
-    .unwrap();
+    if let Ok(json) = serde_json::to_vec(pool) {
+        let _ = encrypted_write(user, prekey_path(user), &json);
+    }
 }
 
 /* ================= SIGNED PREKEY ================= */
 
-pub fn load_or_rotate_signed_prekey(user: &str, identity: &Identity) -> SignedPreKey {
-    let dir = storage_dir(user);
-    fs::create_dir_all(&dir).unwrap();
+/* ================= SIGNED PREKEY ================= */
 
+pub fn load_or_rotate_signed_prekey(user: &str, identity: &Identity) -> SignedPreKey {
+    let _ = fs::create_dir_all(storage_dir(user));
     let path = signed_prekey_path(user);
     let now = current_time();
 
     if Path::new(&path).exists() {
-        let data = fs::read_to_string(&path).unwrap();
-        let stored: SignedPreKey = serde_json::from_str(&data).unwrap();
-
-        if stored.expires_at > now {
-            return stored;
+        if let Some(decrypted) = encrypted_read(user, path.clone()) {
+            if let Ok(stored) = serde_json::from_slice::<SignedPreKey>(&decrypted) {
+                if stored.expires_at > now {
+                    return stored;
+                }
+            }
         }
     }
 
@@ -198,7 +290,9 @@ pub fn load_or_rotate_signed_prekey(user: &str, identity: &Identity) -> SignedPr
         expires_at: now + SIGNED_PREKEY_TTL,
     };
 
-    fs::write(&path, serde_json::to_string_pretty(&spk).unwrap()).unwrap();
+    if let Ok(json) = serde_json::to_vec(&spk) {
+        let _ = encrypted_write(user, path, &json);
+    }
 
     spk
 }
@@ -206,11 +300,12 @@ pub fn load_or_rotate_signed_prekey(user: &str, identity: &Identity) -> SignedPr
 fn current_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 
-#[allow(dead_code)]
+/* ================= PEERS (PUBLIC ONLY) ================= */
+
 #[derive(Serialize, Deserialize)]
 pub struct KnownPeer {
     pub verifying_key: [u8; 32],
@@ -224,10 +319,8 @@ pub(crate) fn peer_path(user: &str, identity_hex: &str) -> String {
     format!("{}/{}.json", peer_dir(user), identity_hex)
 }
 
-#[allow(dead_code)]
 pub fn load_peer(user: &str, identity_hex: &str) -> Option<KnownPeer> {
     let path = peer_path(user, identity_hex);
-
     if Path::new(&path).exists() {
         let data = fs::read_to_string(path).ok()?;
         serde_json::from_str(&data).ok()
@@ -236,16 +329,10 @@ pub fn load_peer(user: &str, identity_hex: &str) -> Option<KnownPeer> {
     }
 }
 
-#[allow(dead_code)]
 pub fn save_peer(user: &str, identity_hex: &str, verifying_key: [u8; 32]) {
-    let dir = peer_dir(user);
-    let _ = fs::create_dir_all(&dir);
-
+    let _ = fs::create_dir_all(peer_dir(user));
     let peer = KnownPeer { verifying_key };
-
-    fs::write(
-        peer_path(user, identity_hex),
-        serde_json::to_string_pretty(&peer).unwrap(),
-    )
-    .ok();
+    if let Ok(json) = serde_json::to_string_pretty(&peer) {
+        let _ = fs::write(peer_path(user, identity_hex), json);
+    }
 }

@@ -1,7 +1,7 @@
 use smp_crypto_core::{
     encryption::{decrypt, encrypt},
     handshake::{derive_session_key, generate_ephemeral},
-    prekey::{create_prekey_bundle, PreKeyBundle},
+    prekey::{create_prekey_bundle, verify_prekey_bundle, PreKeyBundle},
     ratchet::DoubleRatchet,
 };
 
@@ -19,12 +19,19 @@ use smp_protocol::packet::{identity_hash, SmpPacket, SMP_VERSION};
 use ed25519_dalek::VerifyingKey;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{self, AsyncBufReadExt};
 use tokio::time::{sleep, Duration};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+lazy_static::lazy_static! {
+    static ref SEEN_MESSAGES: Mutex<HashSet<[u8; 32]>> = Mutex::new(HashSet::new());
+}
+
 const ROTATION_INTERVAL: u32 = 3;
+const MAX_REPLAY_CACHE: usize = 10_000;
 
 #[tokio::main]
 async fn main() {
@@ -68,7 +75,7 @@ async fn run_bob(user: &str, client: Client) {
 
     let spk = load_or_rotate_signed_prekey(user, &identity);
 
-    let _ = client
+    match client
         .post("http://127.0.0.1:3000/signed_prekey")
         .json(&serde_json::json!({
             "identity_public_key": identity.verifying_key.as_bytes(),
@@ -79,7 +86,19 @@ async fn run_bob(user: &str, client: Client) {
             "expires_at": spk.expires_at,
         }))
         .send()
-        .await;
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            eprintln!("[NETWORK] Signed prekey upload rejected {}", resp.status());
+        }
+        Err(e) => {
+            eprintln!("[NETWORK] Signed prekey upload failed: {:?}", e);
+        }
+        _ => {}
+    }
+
+    let ts_now = now();
+    let ts_expires = ts_now + 86400 * 30; // 30 days
 
     for _ in 0..5 {
         let stored_pk = take_prekey(user, &mut pool);
@@ -90,13 +109,28 @@ async fn run_bob(user: &str, client: Client) {
             public: PublicKey::from(stored_pk.public),
         };
 
-        let bundle = create_prekey_bundle(&identity.signing_key, identity.verifying_key, &one_time);
+        let bundle = create_prekey_bundle(
+            &identity.signing_key,
+            identity.verifying_key,
+            &one_time,
+            ts_now,
+            ts_expires,
+        );
 
-        let _ = client
+        match client
             .post("http://127.0.0.1:3000/prekey")
             .json(&bundle)
             .send()
-            .await;
+            .await
+        {
+            Ok(resp) if !resp.status().is_success() => {
+                eprintln!("[NETWORK] Prekey upload rejected {}", resp.status());
+            }
+            Err(e) => {
+                eprintln!("[NETWORK] Prekey upload failed: {:?}", e);
+            }
+            _ => {}
+        }
     }
 
     println!("Bob ready. Press ENTER to poll inbox.");
@@ -105,18 +139,32 @@ async fn run_bob(user: &str, client: Client) {
     let mut input = String::new();
     loop {
         input.clear();
-        std::io::stdin().read_line(&mut input).unwrap();
+        if let Err(e) = std::io::stdin().read_line(&mut input) {
+            eprintln!("[IO] Failed to read input: {:?}", e);
+            return;
+        }
 
-        if let Ok(resp) = client
+        let resp = match client
             .get(format!("http://127.0.0.1:3000/inbox/{}", bob_hex))
             .send()
             .await
         {
-            if let Ok(messages) = resp.json::<Vec<Vec<u8>>>().await {
-                for raw in messages {
-                    if let Ok(packet) = serde_json::from_slice::<SmpPacket>(&raw) {
-                        handle_incoming_packet(user, &identity, &mut pool, packet, &client).await;
-                    }
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[NETWORK] Inbox request failed: {:?}", e);
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            eprintln!("[NETWORK] Inbox returned status {}", resp.status());
+            continue;
+        }
+
+        if let Ok(messages) = resp.json::<Vec<Vec<u8>>>().await {
+            for raw in messages {
+                if let Ok(packet) = serde_json::from_slice::<SmpPacket>(&raw) {
+                    handle_incoming_packet(user, &identity, &mut pool, packet, &client).await;
                 }
             }
         }
@@ -134,7 +182,10 @@ async fn run_alice(user: &str, client: Client) {
 
     println!("Enter Bob's identity hash:");
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
+    if let Err(e) = std::io::stdin().read_line(&mut input) {
+        eprintln!("[IO] Failed to read input: {:?}", e);
+        return;
+    }
     let bob_hex = input.trim().to_string();
     let session_key = bob_hex.clone();
 
@@ -156,11 +207,14 @@ async fn run_alice(user: &str, client: Client) {
                         msg.retry_count + 1
                     );
 
-                    let _ = resend_client
+                    if let Err(e) = resend_client
                         .post("http://127.0.0.1:3000/send")
                         .body(msg.packet_bytes.clone())
                         .send()
-                        .await;
+                        .await
+                    {
+                        eprintln!("[NETWORK] Retry send failed: {:?}", e);
+                    }
 
                     increment_retry(&resend_user, msg.message_id);
                 }
@@ -213,14 +267,72 @@ async fn send_alice_message(
     } else {
         let eph = generate_ephemeral();
 
-        let resp = client
+        let resp = match client
             .get(format!("http://127.0.0.1:3000/prekey/{}", bob_hex))
             .send()
             .await
-            .unwrap();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[NETWORK] Prekey fetch failed: {:?}", e);
+                return;
+            }
+        };
 
-        let bytes: Vec<u8> = resp.json().await.unwrap();
-        let bundle: PreKeyBundle = serde_json::from_slice(&bytes).unwrap();
+        if !resp.status().is_success() {
+            eprintln!("[NETWORK] Prekey fetch returned status {}", resp.status());
+            return;
+        }
+
+        let bytes: Vec<u8> = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[NETWORK] Invalid prekey response: {:?}", e);
+                return;
+            }
+        };
+
+        let bundle: PreKeyBundle = match serde_json::from_slice(&bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[SECURITY] Malformed prekey bundle: {:?}", e);
+                return;
+            }
+        };
+
+        // Reconstruct expected identity from bob_hex
+        let bob_hash_bytes: [u8; 32] = match hex::decode(bob_hex) {
+            Ok(b) => match b.try_into() {
+                Ok(arr) => arr,
+                Err(_) => {
+                    eprintln!("[SECURITY] Invalid Bob hash length");
+                    return;
+                }
+            },
+            Err(_) => {
+                eprintln!("[SECURITY] Invalid Bob hash encoding");
+                return;
+            }
+        };
+
+        // Validate bundle signature + identity match
+        if let Err(e) = verify_prekey_bundle(&bundle, &bundle.identity_public_key) {
+            eprintln!("[SECURITY] Prekey bundle signature invalid: {:?}", e);
+            return;
+        }
+
+        // Verify bundle identity matches expected Bob
+        let bundle_identity_hash = identity_hash(bundle.identity_public_key.as_bytes());
+        if bundle_identity_hash != bob_hash_bytes {
+            eprintln!("[SECURITY] Prekey bundle identity mismatch. Possible MITM.");
+            return;
+        }
+
+        // Check expiration
+        if bundle.expires_at < now() {
+            eprintln!("[SECURITY] Prekey bundle expired");
+            return;
+        }
 
         prekey_id_for_packet = bundle.prekey_id;
         ephemeral_pubkey = eph.public.to_bytes();
@@ -313,14 +425,22 @@ async fn send_alice_message(
 
     packet.sign(&identity.signing_key);
 
-    client
+    if let Err(e) = client
         .post("http://127.0.0.1:3000/send")
         .json(&packet)
         .send()
         .await
-        .ok();
+    {
+        eprintln!("[NETWORK] Send failed: {:?}", e);
+    }
 
-    let packet_bytes = serde_json::to_vec(&packet).unwrap();
+    let packet_bytes = match serde_json::to_vec(&packet) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[SERIALIZE] Failed to serialize packet: {:?}", e);
+            return;
+        }
+    };
 
     store_outgoing(
         user,
@@ -344,7 +464,7 @@ async fn handle_incoming_packet(
     identity: &smp_crypto_core::identity::Identity,
     pool: &mut storage::PreKeyPool,
     packet: SmpPacket,
-    _client: &Client,
+    client: &Client,
 ) {
     let sender_hex = hex::encode(packet.sender_identity_hash);
     let session_key = sender_hex.clone();
@@ -384,6 +504,19 @@ async fn handle_incoming_packet(
         return;
     }
 
+    // Replay check + insert (only after signature is validated)
+    {
+        let mut seen = SEEN_MESSAGES.lock().unwrap();
+        if seen.contains(&packet.message_id) {
+            eprintln!("[SECURITY] Replay detected (duplicate message_id)");
+            return;
+        }
+        if seen.len() >= MAX_REPLAY_CACHE {
+            seen.clear();
+        }
+        seen.insert(packet.message_id);
+    }
+
     let mut ratchet = if let Some(r) = load_session(user, &session_key, identity) {
         r
     } else {
@@ -408,7 +541,15 @@ async fn handle_incoming_packet(
 
         let mut r = DoubleRatchet::new(shared_secret);
 
-        if let Err(e) = r.bootstrap_as_receiver(matching.secret, packet.dh_ratchet_pub.unwrap()) {
+        let dh_pub = match packet.dh_ratchet_pub {
+            Some(p) => p,
+            None => {
+                eprintln!("[SECURITY] Missing DH ratchet pub during bootstrap");
+                return;
+            }
+        };
+
+        if let Err(e) = r.bootstrap_as_receiver(matching.secret, dh_pub) {
             eprintln!("[SECURITY] Bootstrap failed: {:?}", e);
             return;
         }
@@ -418,8 +559,9 @@ async fn handle_incoming_packet(
 
     /* ================= STATE INVARIANT CHECK ================= */
 
-    if ratchet.chain_key_recv.is_none() && packet.prekey_id == 0 {
-        eprintln!("[SECURITY] Invalid state: no recv chain and no prekey");
+    if ratchet.chain_key_recv.is_none() && packet.prekey_id == 0 && packet.dh_ratchet_pub.is_none()
+    {
+        eprintln!("[SECURITY] Invalid state: no recv chain and no way to derive one");
         return;
     }
 
@@ -458,7 +600,13 @@ async fn handle_incoming_packet(
             return;
         }
 
-        let id: [u8; 32] = decrypted.try_into().unwrap();
+        let id: [u8; 32] = match decrypted.try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                eprintln!("[SECURITY] Invalid ACK payload conversion failed.");
+                return;
+            }
+        };
 
         if mark_acked(user, id) {
             println!("Delivery confirmed for message {}", hex::encode(id));
@@ -474,6 +622,70 @@ async fn handle_incoming_packet(
 
     println!("\n[{}] {}", sender_hex, String::from_utf8_lossy(&decrypted));
 
+    // Send ACK back to sender
+    {
+        use smp_protocol::packet::FLAG_ACK;
+
+        if ratchet.chain_key_send.is_none() {
+            if let Some(remote_pub) = ratchet.dh_remote_public {
+                if let Err(e) = ratchet.advance_send_chain(remote_pub) {
+                    eprintln!("[SECURITY] ACK send chain derivation failed: {:?}", e);
+                }
+            }
+        }
+
+        if let Ok((ack_key, ack_num)) = ratchet.next_sending_key() {
+            let my_hash = identity_hash(identity.verifying_key.as_bytes());
+
+            let mut ack_packet = SmpPacket {
+                version: SMP_VERSION,
+                flags: FLAG_ACK,
+                message_id: [0u8; 32],
+                prekey_id: 0,
+                message_number: ack_num,
+                dh_ratchet_pub: Some(ratchet.dh_self_public),
+                sender_identity_hash: my_hash,
+                sender_verifying_key: identity.verifying_key.to_bytes(),
+                recipient_identity_hash: packet.sender_identity_hash,
+                ephemeral_pubkey: [0u8; 32],
+                timestamp: now(),
+                nonce: [0u8; 12],
+                ciphertext: vec![],
+                signature: [0u8; 64],
+            };
+
+            let ack_aad = ack_packet.serialize_header_for_aad();
+            if let Ok((ct, n)) = encrypt(&ack_key, &packet.message_id, &ack_aad) {
+                ack_packet.nonce = n;
+                ack_packet.ciphertext = ct;
+
+                let mut hasher = Sha256::new();
+                hasher.update(ack_packet.sender_identity_hash);
+                hasher.update(ack_packet.message_number.to_be_bytes());
+                hasher.update(&ack_packet.nonce);
+                hasher.update(&ack_packet.ciphertext);
+                ack_packet.message_id = hasher.finalize().into();
+
+                ack_packet.sign(&identity.signing_key);
+
+                match client
+                    .post("http://127.0.0.1:3000/send")
+                    .json(&ack_packet)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if !resp.status().is_success() => {
+                        eprintln!("[NETWORK] ACK rejected {}", resp.status());
+                    }
+                    Err(e) => {
+                        eprintln!("[NETWORK] ACK send failed: {:?}", e);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     save_session(user, &session_key, identity, &ratchet);
 }
 
@@ -483,18 +695,29 @@ async fn poll_alice_inbox(
     identity: &smp_crypto_core::identity::Identity,
     alice_hex: &str,
 ) {
-    if let Ok(resp) = client
+    let resp = match client
         .get(format!("http://127.0.0.1:3000/inbox/{}", alice_hex))
         .send()
         .await
     {
-        if let Ok(messages) = resp.json::<Vec<Vec<u8>>>().await {
-            let mut pool = load_or_create_prekey_pool(user);
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[NETWORK] Inbox request failed: {:?}", e);
+            return;
+        }
+    };
 
-            for raw in messages {
-                if let Ok(packet) = serde_json::from_slice::<SmpPacket>(&raw) {
-                    handle_incoming_packet(user, identity, &mut pool, packet, client).await;
-                }
+    if !resp.status().is_success() {
+        eprintln!("[NETWORK] Inbox returned status {}", resp.status());
+        return;
+    }
+
+    if let Ok(messages) = resp.json::<Vec<Vec<u8>>>().await {
+        let mut pool = load_or_create_prekey_pool(user);
+
+        for raw in messages {
+            if let Ok(packet) = serde_json::from_slice::<SmpPacket>(&raw) {
+                handle_incoming_packet(user, identity, &mut pool, packet, client).await;
             }
         }
     }
@@ -503,8 +726,11 @@ async fn poll_alice_inbox(
 /* ========================= UTIL ========================= */
 
 fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(e) => {
+            eprintln!("[TIME] Clock error: {:?}", e);
+            0
+        }
+    }
 }

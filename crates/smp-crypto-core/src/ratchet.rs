@@ -133,6 +133,27 @@ impl DoubleRatchet {
         Ok(())
     }
 
+    /// Generate new keypair and derive send chain without touching recv chain.
+    /// Used after bootstrap_as_receiver when the receiver first needs to send.
+    pub fn advance_send_chain(&mut self, remote_pub: [u8; 32]) -> Result<(), CryptoError> {
+        let remote = PublicKey::from(remote_pub);
+
+        let new_secret = StaticSecret::random();
+        let new_public = PublicKey::from(&new_secret);
+
+        self.dh_self_secret = new_secret.to_bytes();
+        self.dh_self_public = new_public.to_bytes();
+
+        let dh = new_secret.diffie_hellman(&remote).to_bytes();
+        let (new_root, send_chain) = Self::kdf_root(&self.root_key, &dh)?;
+
+        self.root_key = new_root;
+        self.chain_key_send = Some(send_chain);
+        self.ns = 0;
+
+        Ok(())
+    }
+
     pub fn bootstrap_as_receiver(
         &mut self,
         self_secret_bytes: [u8; 32],

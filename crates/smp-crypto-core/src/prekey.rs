@@ -21,6 +21,8 @@ pub struct PreKeyBundle {
     pub prekey_id: u32,
     pub prekey_public: PublicKey,
     pub signature: Signature,
+    pub created_at: u64,
+    pub expires_at: u64,
 }
 
 pub fn generate_one_time_prekey() -> OneTimePreKey {
@@ -36,8 +38,11 @@ pub fn create_prekey_bundle(
     signing_key: &SigningKey,
     identity_public: VerifyingKey,
     one_time: &OneTimePreKey,
+    created_at: u64,
+    expires_at: u64,
 ) -> PreKeyBundle {
     let mut message = Vec::new();
+    message.extend_from_slice(b"SMP_PREKEY_SIG");
     message.extend_from_slice(&one_time.id.to_be_bytes());
     message.extend_from_slice(one_time.public.as_bytes());
 
@@ -48,12 +53,22 @@ pub fn create_prekey_bundle(
         prekey_id: one_time.id,
         prekey_public: one_time.public,
         signature,
+        created_at,
+        expires_at,
     }
 }
 
-pub fn verify_prekey_bundle(bundle: &PreKeyBundle) -> Result<(), CryptoError> {
-    let mut message = Vec::new();
+pub fn verify_prekey_bundle(
+    bundle: &PreKeyBundle,
+    expected_identity: &VerifyingKey,
+) -> Result<(), CryptoError> {
+    // Verify identity matches expected
+    if bundle.identity_public_key != *expected_identity {
+        return Err(CryptoError::InvalidKey);
+    }
 
+    let mut message = Vec::new();
+    message.extend_from_slice(b"SMP_PREKEY_SIG");
     message.extend_from_slice(&bundle.prekey_id.to_be_bytes());
     message.extend_from_slice(bundle.prekey_public.as_bytes());
 
