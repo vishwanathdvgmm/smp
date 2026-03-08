@@ -18,7 +18,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const PREKEY_POOL_SIZE: usize = 20;
 const REFILL_THRESHOLD: usize = 5;
 const REFILL_BATCH: usize = 10;
-const SIGNED_PREKEY_TTL: u64 = 60 * 60 * 24;
+const SIGNED_PREKEY_TTL: u64 = 60 * 60 * 24; // 24 hours
 const MASTER_KEY_FILE: &str = "master.key";
 
 /* ================= PATH HELPERS ================= */
@@ -28,15 +28,15 @@ pub fn storage_dir(user: &str) -> String {
 }
 
 fn identity_path(user: &str) -> String {
-    format!("{}/identity.json", storage_dir(user))
+    format!("{}/identity.bin", storage_dir(user))
 }
 
 fn prekey_path(user: &str) -> String {
-    format!("{}/prekeys.json", storage_dir(user))
+    format!("{}/prekeys.bin", storage_dir(user))
 }
 
 fn signed_prekey_path(user: &str) -> String {
-    format!("{}/signed_prekey.json", storage_dir(user))
+    format!("{}/signed_prekey.bin", storage_dir(user))
 }
 
 fn master_key_path(user: &str) -> String {
@@ -253,8 +253,6 @@ fn persist_pool(user: &str, pool: &PreKeyPool) {
         let _ = encrypted_write(user, prekey_path(user), &json);
     }
 }
-
-/* ================= SIGNED PREKEY ================= */
 
 /* ================= SIGNED PREKEY ================= */
 

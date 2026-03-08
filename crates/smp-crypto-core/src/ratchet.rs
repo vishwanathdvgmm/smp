@@ -1,7 +1,7 @@
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -26,7 +26,10 @@ pub struct DoubleRatchet {
     pub pn: u32,
 
     #[zeroize(skip)]
-    pub skipped_keys: HashMap<u32, [u8; 32]>,
+    pub skipped_keys: HashMap<String, [u8; 32]>,
+
+    #[zeroize(skip)]
+    pub skipped_order: VecDeque<String>,
 }
 
 impl DoubleRatchet {
@@ -47,6 +50,7 @@ impl DoubleRatchet {
             nr: 0,
             pn: 0,
             skipped_keys: HashMap::new(),
+            skipped_order: VecDeque::new(),
         }
     }
 
@@ -83,13 +87,39 @@ impl DoubleRatchet {
         Ok((new_chain, message_key))
     }
 
+    /* ================= SKIPPED KEY STORAGE ================= */
+
+    fn store_skipped(&mut self, msg: u32, key: [u8; 32]) {
+        if let Some(remote) = self.dh_remote_public {
+            let index = (remote, msg);
+
+            if self.skipped_keys.len() >= MAX_STORED_SKIPPED {
+                if let Some(old) = self.skipped_order.pop_front() {
+                    self.skipped_keys.remove(&old);
+                }
+            }
+
+            self.skipped_keys.insert(index, key);
+            self.skipped_order.push_back(index);
+        }
+    }
+
+    fn take_skipped(&mut self, msg: u32) -> Option<[u8; 32]> {
+        if let Some(remote) = self.dh_remote_public {
+            let index = (remote, msg);
+            if let Some(k) = self.skipped_keys.remove(&index) {
+                return Some(k);
+            }
+        }
+        None
+    }
+
     /* ================= DH RATCHET STEP ================= */
 
     pub fn dh_ratchet_step(&mut self, remote_pub: [u8; 32]) -> Result<(), CryptoError> {
         let remote = PublicKey::from(remote_pub);
         let self_secret = StaticSecret::from(self.dh_self_secret);
 
-        // Step 1: derive new recv chain
         let dh1 = self_secret.diffie_hellman(&remote).to_bytes();
         let (new_root, new_recv_chain) = Self::kdf_root(&self.root_key, &dh1)?;
 
@@ -102,14 +132,12 @@ impl DoubleRatchet {
 
         self.dh_remote_public = Some(remote_pub);
 
-        // Step 2: generate new DH keypair
         let new_secret = StaticSecret::random();
         let new_public = PublicKey::from(&new_secret);
 
         self.dh_self_secret = new_secret.to_bytes();
         self.dh_self_public = new_public.to_bytes();
 
-        // Step 3: derive new send chain
         let dh2 = new_secret.diffie_hellman(&remote).to_bytes();
         let (new_root2, new_send_chain) = Self::kdf_root(&self.root_key, &dh2)?;
 
@@ -133,8 +161,6 @@ impl DoubleRatchet {
         Ok(())
     }
 
-    /// Generate new keypair and derive send chain without touching recv chain.
-    /// Used after bootstrap_as_receiver when the receiver first needs to send.
     pub fn advance_send_chain(&mut self, remote_pub: [u8; 32]) -> Result<(), CryptoError> {
         let remote = PublicKey::from(remote_pub);
 
@@ -193,14 +219,15 @@ impl DoubleRatchet {
     /* ================= RECEIVING ================= */
 
     pub fn receive_key(&mut self, message_number: u32) -> Result<[u8; 32], CryptoError> {
+        if let Some(k) = self.take_skipped(message_number) {
+            return Ok(k);
+        }
+
         if message_number < self.nr {
-            if let Some(key) = self.skipped_keys.remove(&message_number) {
-                return Ok(key);
-            }
             return Err(CryptoError::InvalidKey);
         }
 
-        if message_number - self.nr > MAX_SKIP {
+        if message_number.saturating_sub(self.nr) > MAX_SKIP {
             return Err(CryptoError::InvalidKey);
         }
 
@@ -211,13 +238,8 @@ impl DoubleRatchet {
 
             self.chain_key_recv = Some(new_ck);
 
-            if self.skipped_keys.len() >= MAX_STORED_SKIPPED {
-                if let Some(first_key) = self.skipped_keys.keys().next().cloned() {
-                    self.skipped_keys.remove(&first_key);
-                }
-            }
+            self.store_skipped(self.nr, mk);
 
-            self.skipped_keys.insert(self.nr, mk);
             self.nr += 1;
         }
 
