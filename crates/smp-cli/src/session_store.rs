@@ -35,7 +35,7 @@ pub fn save_session(user: &str, peer_hex: &str, identity: &Identity, ratchet: &D
     let _ = fs::create_dir_all(session_dir(user));
 
     // Serialize ratchet directly, prepend version byte — avoids clone
-    let ratchet_bytes = match serde_json::to_vec(ratchet) {
+    let ratchet_bytes = match bincode::serialize(ratchet) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[SESSION] Serialize failed: {:?}", e);
@@ -131,7 +131,7 @@ pub fn load_session(user: &str, peer_hex: &str, identity: &Identity) -> Option<D
         return None;
     }
 
-    match serde_json::from_slice(&decrypted[1..]) {
+    match bincode::deserialize(&decrypted[1..]) {
         Ok(r) => Some(r),
         Err(e) => {
             eprintln!("[SESSION] Deserialize failed: {:?}", e);
